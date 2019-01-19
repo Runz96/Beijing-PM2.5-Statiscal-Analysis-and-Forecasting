@@ -1,0 +1,685 @@
+---
+title: "PM2.5 Forecasting"
+author: "Runze Yan"
+date: "2018/11/23"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+sourcedir <- "C://Users//Runz//Desktop//PM2.5"
+datadir <- "C://Users//Runz//Desktop//PM2.5//Data"
+source("SPM_Panel.R")
+require("knitr")
+library(forecast)
+library(mtsdi)
+library(MTS)
+library(MASS)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(zoo)
+library(mice)
+library(VIM)
+library(car)
+library(glmnet)
+library(caret)
+library(prophet)
+library(ggplot2)
+opts_knit$set(root.dir = sourcedir)
+```
+
+# Load data 
+```{r}
+# Explanations for each variable
+# No: row number 
+# year: year of data in this row 
+# month: month of data in this row 
+# day: day of data in this row 
+# hour: hour of data in this row 
+# pm2.5: PM2.5 concentration (ug/m^3) 
+# DEWP: Dew Point (°F) 
+# TEMP: Temperature (°F) 
+# PRES: Pressure (hPa) 
+# cbwd: Combined wind direction 
+# Iws: Cumulated wind speed (m/s) 
+# Is: Cumulated hours of snow 
+# Ir: Cumulated hours of rain 
+#create new data frame
+setwd(datadir)
+prsa <- read.csv('PRSA_data_2010.1.1-2014.12.31.csv', row.names = 1, colClasses = c("pm2.5"="numeric","DEWP"="numeric"))
+summary(prsa)
+```
+
+# Change "cv"" in cbwd to "SW"
+```{r}
+levels(prsa$cbwd)[1] <- "SW"
+# sort it to NE, NW, SE, SW
+prsa$cbwd <- factor(prsa$cbwd, levels = c("NE", "NW", "SE", "SW"))
+summary(prsa$cbwd)
+```
+
+# Create datetime from year, month, day and hour
+# Sort the dataframe by datetime
+```{r}
+prsa <- prsa %>%
+  mutate(date = make_date(year, month, day),
+         datetime = make_datetime(year, month, day, hour)) %>%
+  arrange(datetime)
+summary(prsa)
+```
+
+# Plot the distribution of each variable
+```{r}
+which(colnames(prsa) == "pm2.5")
+which(colnames(prsa) == "Ir")
+for(i in 5:12) {
+  if(is.factor(prsa[,i])) {
+    print(ggplot(prsa, aes(prsa[, i])) +
+            geom_histogram(stat = "count") +
+            xlab(colnames(prsa)[i]))
+  }
+  else {
+    print(ggplot(prsa, aes(prsa[, i])) +
+            geom_histogram(binwidth = 2) +
+            xlab(colnames(prsa)[i]))
+  }
+}
+```
+
+# Correlations between pm2.5 and other variables
+```{r}
+for(i in 6:12) {
+  if(!is.factor(prsa[,i])) {
+    print(paste("pm2.5 & ", colnames(prsa)[i], sep = ""))
+    print(cor(prsa$pm2.5, prsa[, i], use = "complete.obs"))
+    print(ggplot(prsa, aes(prsa[,i], pm2.5)) +
+            geom_point() +
+            xlab(colnames(prsa)[i]))
+  }
+  else {
+    print(ggplot(prsa, aes(prsa[,i], pm2.5)) +
+            geom_boxplot() +
+            xlab(colnames(prsa)[i]))
+  }
+}
+```
+
+# dewp has positive correlation, whereas lws, ls and lr have negative correlation
+
+# Why is there an N-shape in the plot of pm2.5 vs Iws? Are they outliers?
+
+# Boxplot of each variable
+```{r}
+for(i in 6:12) {
+  if(!is.factor(prsa[,i])) {
+    print(ggplot(prsa, aes(prsa[,i], prsa[,i])) +
+            geom_boxplot() +
+            xlab(colnames(prsa)[i]) +
+            ylab("Count"))
+  }
+}
+```
+
+# Iws has many outliers
+
+# Are there any correlations between those weather variables?
+```{r}
+for(i in 6:12) {
+  for(j in (i+1):12) {
+    if(j <= 12 & j > i & !is.factor(prsa[,i]) & !is.factor(prsa[,j])) {
+      print(paste(colnames(prsa)[i], "&", colnames(prsa)[j], sep = " "))
+      print(cor(prsa[,i], prsa[,j]))
+      print(ggplot(prsa, aes(prsa[,i], prsa[,j])) + 
+              geom_point() +
+              xlab(colnames(prsa)[i]) +
+              ylab(colnames(prsa)[j]))
+    }
+  }
+}
+```
+
+# dewp and temp have positive correlation
+# dewp and pres have negative correlation
+# temp and pres have negative correlation
+
+# plot time series of pm2.5
+```{r}
+ggplot(prsa, aes(datetime, pm2.5)) +
+  geom_line() + 
+  scale_x_datetime(date_breaks = "6 months", limits = c(as.POSIXct("2009-12-01"), as.POSIXct("2015-01-31"))) +
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# From the plots above, we can get that PM2.5 is highly correlated with Dew Point, Temperature, Pressure and cbwd
+# Build the new dataframe 
+```{r}
+prsa.omit <- prsa[,c(5,6,7,8,9,13)]
+summary(prsa.omit)
+uva.pairs(prsa.omit)
+```
+
+# Analysis of the missing data(NAs)
+```{r}
+prsa.omit[!complete.cases(prsa.omit),]
+sum(is.na(prsa.omit))
+aggr(prsa.omit,prop=F,numbers=T)
+```
+
+# The total number of NAs is 2067
+
+# Impute the missing data
+```{r}
+newdata <- prsa.omit
+data <- mice(newdata, m=5, method = 'pmm', maxit = 10, seed = 1)
+data$imp
+pm2.5 <- complete(data)
+summary(pm2.5)
+```
+
+
+# Check the mode of each variable
+```{r}
+sapply(pm2.5, class)
+```
+
+# The only apparent categorical variable in our dataset is cbwd, the wind direction
+# Create the dummy variables of wind direction
+```{r}
+pm2.5 <- pm2.5 %>% mutate(SW = as.numeric(cbwd == 'SW'))
+pm2.5 <- pm2.5 %>% mutate(NE = as.numeric(cbwd == 'NE'))
+pm2.5 <- pm2.5 %>% mutate(NW = as.numeric(cbwd == 'NW'))
+pm2.5 <- pm2.5 %>% mutate(SE = as.numeric(cbwd == 'SE'))
+```
+
+# "SW", "NE", "NW", "SE" are four new variables in the dataframe pm2.5
+```{r}
+summary(pm2.5)
+```
+
+# Preparing for training and test set
+```{r}
+#shuffle dataset and create train and test set
+set.seed(1234567)
+n <- nrow(pm2.5)
+shuffled <- pm2.5[sample(n),]
+
+train <- shuffled[1:round(0.7 * n),]
+test <- shuffled[(round(0.7 * n) + 1):n,]
+
+summary(train)
+summary(test)
+```
+
+# Build a main effects model 
+```{r}
+pm2.5.lm1 <- lm(pm2.5 ~ DEWP + TEMP + PRES + SW + NE + NW + SE, data = train)
+summary(pm2.5.lm1)
+```
+
+# Diagnose the model
+```{r}
+par(mfrow = c(2,2))
+plot(pm2.5.lm1)
+par(mfrow = c(1,1))
+save_data <- c()
+for(i in 1:1000){
+  result_test <- shapiro.test(sample(pm2.5.lm1$residuals,5000))
+  save_data <- append(save_data,result_test[[2]])
+}
+length(save_data[save_data<=0.05])
+```
+
+# From Normal Q-Q plot and shapiro test result, we know that the residuals are not normally distributed. So we need do box-cox transformation
+
+# However, box-cox transformation cannot be applied here. From the density plot of pm2.5, we can know that the response variable can be negative. However, box-cox transformation includes the log transformation as a particular case. So here, we introduce the IHS(Inverse Hyperbolic Sine) transformation
+
+# Density Plot of pm2.5 time series
+```{r}
+plot(density(log(pm2.5$pm2.5)))
+summary(pm2.5.lm1)
+```
+
+# IHS(Inverse Hyperbolic Sine) transformation. The IHS transformation works with data defined on the whole real line including zeros. For large values of x, IHS behaves like a log transformation, and the transformation accommodates values of 0
+```{r}
+ihs <- function(x) {
+  y <- log(x + sqrt(x ^ 2 + 1))
+  return(y)
+}
+```
+
+# Take the IHS of the response variable pm2.5
+```{r}
+pm2.5.lm1.ihs <- lm(ihs(pm2.5) ~ DEWP + TEMP + PRES + SW + NE + NW + SE, data = train)
+summary(pm2.5.lm1.ihs)
+```
+
+# Diagnose the model
+```{r}
+par(mfrow = c(2,2))
+plot(pm2.5.lm1.ihs)
+par(mfrow = c(1,1))
+save_data <- c()
+for(i in 1:1000){
+  result_test <- shapiro.test(sample(pm2.5.lm1.ihs$residuals,5000))
+  save_data <- append(save_data,result_test[[2]])
+}
+length(save_data[save_data<=0.05])
+```
+
+# From the Normal Q-Q plot, we get that the residual is nealy normally distributed. So we can say that the ihs transformation rastically increased the adjusted R 2 and significantly improved the model assumptions.
+
+# Build a main effects + interation model 
+```{r}
+pm2.5.lm2 <- lm(pm2.5 ~ (DEWP + TEMP + 
+    PRES + SW + NE + NW + SE)^2, data = train)
+summary(pm2.5.lm2)
+```
+
+# Diagnose the mdoel
+```{r}
+par(mfrow = c(2,2))
+plot(pm2.5.lm2)
+par(mfrow = c(1,1))
+save_data <- c()
+for(i in 1:1000){
+  result_test <- shapiro.test(sample(pm2.5.lm2$residuals,5000))
+  save_data <- append(save_data,result_test[[2]])
+}
+length(save_data[save_data<=0.05])
+```
+
+# From the Normal Q-Q plot and the shapiro test result, we know that the residuals are not normally distributed. So we need do IHS(Inverse Hyperbolic Sine) transformation
+# Take the IHS of the response variable pm2.5
+```{r}
+pm2.5.lm2.ihs <- lm(ihs(pm2.5) ~ (DEWP + TEMP + 
+    PRES + SW + NE + NW + SE)^2, data = train)
+summary(pm2.5.lm2.ihs)
+```
+
+# Test the model
+```{r}
+par(mfrow = c(2,2))
+plot(pm2.5.lm2.ihs)
+par(mfrow = c(1,1))
+save_data <- c()
+for(i in 1:1000){
+  result_test <- shapiro.test(sample(pm2.5.lm2.ihs$residuals,5000))
+  save_data <- append(save_data,result_test[[2]])
+}
+length(save_data[save_data<=0.05])
+```
+
+# The residual of pm2.5.lm.ihs is nearly normally distributed and significantly improve the model assumption
+# Use stepwise regressio on your main effects + interation model
+```{r}
+pm2.5.lm2.step <- step(pm2.5.lm2.ihs)
+```
+
+# Choose the new model
+```{r}
+summary(pm2.5.lm2.step)
+```
+
+# Diagnose the model
+```{r}
+par(mfrow = c(2,2))
+plot(pm2.5.lm2.step)
+par(mfrow = c(1,1))
+save_data <- c()
+for(i in 1:1000){
+  result_test <- shapiro.test(sample(pm2.5.lm2.step$residuals,5000))
+  save_data <- append(save_data,result_test[[2]])
+}
+length(save_data[save_data<=0.05])
+```
+
+# From Normal Q-Q plot and shapiro test result, we know that the residuals are normally distributed.
+
+# Compare the AIC of the two model
+```{r}
+AIC(pm2.5.lm1.ihs)
+AIC(pm2.5.lm2.step)
+anova(pm2.5.lm1.ihs)
+anova(pm2.5.lm2.step)
+```
+
+# The second model has better performance to fit the data
+
+# Assessing test set performance
+```{r}
+pred1 <- predict(pm2.5.lm1.ihs, test)
+pred2 <- predict(pm2.5.lm2.step, test)
+head(pred1)
+head(pred2)
+```
+
+Plotting of train and test data against actural performance
+```{r}
+train.pred1 <- predict(pm2.5.lm1.ihs)
+test.pred1 <- predict(pm2.5.lm1.ihs, test)
+
+train.pred2 <- predict(pm2.5.lm2.ihs)
+test.pred2 <- predict(pm2.5.lm2.ihs, test)
+
+plot.train1 <- ggplot(train, aes(x = train.pred1, y = train$pm2.5)) +
+  geom_point() +
+  geom_abline(color = "red")
+
+plot.test1 <- ggplot(test, aes(x = test.pred1, y = test$pm2.5)) +
+  geom_point() +
+  geom_abline(color = "red")
+
+plot.train1
+plot.test1
+
+plot.train2 <- ggplot(train, aes(x = train.pred2, y = pm2.5)) +
+  geom_point() +
+  geom_abline(color = "red")
+
+plot.test2 <- ggplot(test, aes(x = test.pred2, y = pm2.5)) +
+  geom_point() +
+  geom_abline(color = "red")
+
+plot.train2
+plot.test2
+```
+
+# Check which model is fitting better
+# Test for pm2.5.lm1.ihs
+```{r}
+predictions <- pm2.5.lm1.ihs%>% predict(test)
+data.frame( R2 = R2(predictions, test$pm2.5),
+            RMSE = RMSE(predictions, test$pm2.5),
+            MAE = MAE(predictions, test$pm2.5))
+```
+
+# Test for the pm.2.5.lm2.step
+```{r}
+predictions <- pm2.5.lm2.step%>% predict(test)
+data.frame( R2 = R2(predictions, test$pm2.5),
+            RMSE = RMSE(predictions, test$pm2.5),
+            MAE = MAE(predictions, test$pm2.5))
+```
+
+# Now we and see that the second model is more optimal model, but from the plot above, both models doesn't have good performance. And to improve the performance, we need to check if the model has multicollinearity problem.
+
+# VIF and Conditional Number k
+```{r}
+vif(pm2.5.lm2.step)
+kappa(pm2.5.lm2.step)
+```
+
+# VIF is almost bigger than 5 or 10 and Condtional Number is bigger than 30, which implys that there exits severe multicollinearity problem
+
+# LASSO
+```{r}
+x = model.matrix(pm2.5.lm2.step)
+y = train$pm2.5
+```
+
+# Setting Parameters
+```{r}
+set.seed(888)
+train1 = sample(1:nrow(train), .7 * nrow(train))
+test1 = (-train1)
+ytest = y[test1]
+lambda <- 10^seq(10, -2, length = 100)
+```
+
+# Choosing Best lambda
+```{r}
+cv.out <- cv.glmnet(x[train1, ], y[train1], alpha = 1)
+plot(cv.out)
+bestlam <- cv.out$lambda.min
+```
+
+# The Plot of Lambda 
+
+# Lasso Predictions
+```{r}
+lasso.mod <- glmnet(x[train1, ], y[train1], alpha = 1, lambda = lambda)
+plot(lasso.mod)
+lasso.pred <-predict(lasso.mod, s = bestlam, newx = x[test1,])
+mean((lasso.pred - ytest)^2)
+```
+
+# The Plot of Coefficients Varying with Parameters in Lasso Regression
+
+# Coefficient Analysis
+```{r}
+out = glmnet(x, y, alpha = 1, lambda = lambda)
+lasso_coef = predict(out, type = "coefficients", s= bestlam)[1:16,]
+lasso_coef
+```
+
+# Aggregate to daily maxima for model building
+```{r}
+summary(pm2.5)
+dailyPM2.5 <- aggregate(pm2.5$pm2.5, by = list(pm2.5$date), FUN = max)
+colnames(dailyPM2.5) <- c("date", "pm2.5")
+print(dailyPM2.5)
+```
+
+# Create time series of pm2.5
+```{r}
+pm2.5.ts <- ts(dailyPM2.5$pm2.5)
+pm2.5.ts.days <- c(1:length(dailyPM2.5$pm2.5))
+plot(pm2.5.ts.days, pm2.5.ts, type = "l")
+```
+
+# ACF and PACF of the pm2.5 time series 
+```{r}
+par(mfrow = c(1,2))
+acf(pm2.5.ts[pm2.5.ts.days], main = "ACF of pm2.5.ts")
+pacf(pm2.5.ts[pm2.5.ts.days], main = "PACF of pm2.5.ts")
+par(mfrow = c(1,1))
+```
+# The pm2.5 time series is stationary
+
+# Model the trend of the pm2.5 time series
+```{r}
+pm2.5.ts.trend <- lm(pm2.5.ts ~ pm2.5.ts.days)
+summary(pm2.5.ts.trend)
+plot(pm2.5.ts.days, pm2.5.ts, type = "l")
+abline(pm2.5.ts.trend, col = "red")
+```
+
+# Test the result
+```{r}
+par(mfrow = c(2,2))
+plot(pm2.5.ts.trend)
+par(mfrow = c(1,1))
+par(mfrow = c(1,2))
+acf(pm2.5.ts.trend$residuals, main = "ACF of the residuals from pm2.5.ts.trend")
+pacf(pm2.5.ts.trend$residuals, main = "PACF of the resiudals from pm2.5.ts.trend")
+par(mfrow = c(1,1))
+shapiro.test(pm2.5.ts.trend$residuals)
+```
+# The p-value of Shapiro-Wilk normality test is less than 0.05 implying that residual is significantly not normally distributed. No pattern is apparent on the plot of residuals against the predicted values, or the risiduals over time. As shown the ACF plot of pm2.5.ts, there exists a seasonality of 7 days. There are peaches in every 7 days and there are a lot of spikes in pacf plot. Thus we consider to add seasonality components to our model.
+
+# Model the seasonality of the pm2.5 time series
+```{r}
+pm2.5.ts.trend.seasonal <- lm(pm2.5.ts ~ pm2.5.ts.days + sin(2*pi*pm2.5.ts.days/7) + cos(2*pi*pm2.5.ts.days/7))
+summary(pm2.5.ts.trend.seasonal)
+```
+
+# Diagnose the result
+```{r}
+par(mfrow = c(2,2)) 
+plot(pm2.5.ts.trend.seasonal)
+par(mfrow = c(1,2))
+acf(pm2.5.ts.trend.seasonal$residuals, main = "ACF plot of Residuals from pm2.5.ts.trend.seasonal")
+pacf(pm2.5.ts.trend.seasonal$residuals, main = "PACF plot of Residuals from pm2.5.ts.trend.seasonal")
+par(mfrow=c(1,1))
+shapiro.test(pm2.5.ts.trend.seasonal$residuals)
+```
+
+# The p-value of Shapiro-Wilk normality test is less than 0.05 implying that residual is significantly not normally distributed, which violates assumption of linear regression. Then we use box cox transformation to normalize the data, and then refit the linear model. And still acf plot shows potential seasonality.
+
+# Box-cox transformation
+```{r}
+L <- boxcox(pm2.5.ts.trend.seasonal, plotit = F)$x[which.max(boxcox(pm2.5.ts.trend.seasonal, plotit = F)$y)]
+pm2.5.ts.trend.seasonal1 <- lm(pm2.5.ts^L ~ pm2.5.ts.days + sin(2*pi*pm2.5.ts.days/7) + cos(2*pm2.5.ts.days/7))
+summary(pm2.5.ts.trend.seasonal1)
+```
+
+# Diagnose the model
+```{r}
+par(mfrow = c(2,2)) 
+plot(pm2.5.ts.trend.seasonal1)
+par(mfrow = c(1,2))
+acf(pm2.5.ts.trend.seasonal1$residuals, main = "ACF plot of Residuals from pm2.5.ts.trend.seasonal1")
+pacf(pm2.5.ts.trend.seasonal1$residuals, main = "PACF plot of Residuals from pm2.5.ts.trend.seasonal1")
+par(mfrow=c(1,1))
+shapiro.test(pm2.5.ts.trend.seasonal1$residuals)
+```
+
+# The p-value of Shapiro-Wilk normality test is bigger than 0.05 implying that the residual confers to normal distribution, which agree with assumption of linear regression.
+
+# Build the arima model of the residual of the linear model of the pm2.5 time series
+```{r}
+pm2.5.ts.autoarima <- auto.arima(pm2.5.ts.trend.seasonal1$residuals)
+summary(pm2.5.ts.autoarima)
+```
+
+# Diagnose the model
+```{r}
+tsdiag(pm2.5.ts.autoarima,gof.lag=20)
+qqnorm(pm2.5.ts.autoarima$residuals)
+qqline(pm2.5.ts.autoarima$residuals,col="blue")
+shapiro.test(pm2.5.ts.autoarima$residuals)
+par(mfrow=c(1,2))
+acf(pm2.5.ts.autoarima$residuals, main="ACF of Residuals from pm2.5.ts.autoarima")
+pacf(pm2.5.ts.autoarima$residuals,main="PACF of Residuals from pm2.5.ts.autoarima")
+par(mfrow=c(1,1))
+Box.test(pm2.5.ts.autoarima$residuals,type="Ljung-Box")
+```
+
+# Shapiro Wilk normality test and box Ljung test shows residual of the arima is normally distributed. In the ACF and PACF plot, nearly almost lags are within confidence interval implying that there isn't any autocorrelation.
+
+
+# Using just arima model
+# ACF and PACF of the pm2.5 time series 
+```{r}
+par(mfrow = c(1,2))
+acf(pm2.5.ts[pm2.5.ts.days], main = "ACF of pm2.5.ts")
+pacf(pm2.5.ts[pm2.5.ts.days], main = "PACF of pm2.5.ts")
+par(mfrow = c(1,1))
+```
+
+# From the ACf and PACF plot of the pm2.5 time series, we can get that p=1 and q=4
+```{r}
+arima1 <- arima(pm2.5.ts, order = c(1, 0, 4))
+summary(arima1)
+```
+
+# ACF and PACF of arima1
+```{r}
+tsdiag(arima1,gof.lag=20)
+qqnorm(arima1$residuals)
+qqline(arima1$residuals,col="blue")
+shapiro.test(arima1$residuals)
+par(mfrow=c(1,2))
+acf(arima1$residuals, main="ACF of Residuals from arima1")
+pacf(arima1$residuals,main="PACF of Residuals from arima1")
+par(mfrow=c(1,1))
+Box.test(arima1$residuals,type="Ljung-Box")
+```
+
+# Use auto.arima() to model 
+```{r}
+autoarima1 <- auto.arima(pm2.5.ts)
+summary(autoarima1)
+```
+
+# Build ARIMA(1,0,0) 
+```{r}
+tsdiag(autoarima1,gof.lag=20)
+qqnorm(autoarima1$residuals)
+qqline(autoarima1$residuals,col="blue")
+shapiro.test(autoarima1$residuals)
+par(mfrow=c(1,2))
+acf(autoarima1$residuals, main="ACF of Residuals from autoarima1")
+pacf(autoarima1$residuals,main="PACF of Residuals from autoarima1")
+par(mfrow=c(1,1))
+Box.test(autoarima1$residuals,type="Ljung-Box")
+```
+
+# Comparision of the two just arima models
+```{r}
+AIC(arima1)
+AIC(autoarima1)
+```
+
+# Since we choose the model with less AIC, so we choose the model arima1
+
+# Compare arima1 with pm2.5.ts.autoarima on forecasting the next 30 days
+# Prediction for the next 30 days by pm2.5.ts.trend .seasonal1 and its MSE
+```{r}
+next.6mo.time <- c((length(pm2.5.ts)-29):(length(pm2.5.ts)))
+next.6mo <- data.frame(pm2.5.ts.days = next.6mo.time, pm2.5 = pm2.5.ts[next.6mo.time])
+next.6mo.ts <- ts(next.6mo$pm2.5)
+E_Y.pred <- predict(pm2.5.ts.trend.seasonal1, newdata = next.6mo)
+e_t.pred <- forecast(pm2.5.ts.autoarima, h=30)
+next.6mo.prediction <- (E_Y.pred + e_t.pred$mean)^(1/L)
+mean((next.6mo.prediction-next.6mo$pm2.5)^2)
+```
+
+# Plot actual values and predicted values and confidence intervals
+```{r}
+plot(ts(next.6mo$pm2.5),type='o',ylim=c(-300,700))
+lines(ts(next.6mo.prediction),col='red',type='o')
+lines(1:30, (E_Y.pred + e_t.pred$lower[,2])^(1/L), col = "red", lty = "dashed")
+lines(1:30, (E_Y.pred + e_t.pred$upper[,2])^(1/L), col = "red", lty = "dashed")
+legend(1,5, legend = c("Actual", "Predicted"), lwd = 2, col = c("black", "red"))
+```
+
+# Prediction for the next 30 days by arima1 and its MSE
+```{r}
+e_t.pred2 <- forecast(arima1, h=30)
+next.6mo.prediction2 <- e_t.pred2$mean
+mean((next.6mo.prediction2-next.6mo$pm2.5))
+```
+
+# Plot actual values and predicted values and confidence intervals
+```{r}
+plot(ts(next.6mo$pm2.5), type='o', ylim=c(-300,700))
+lines(ts(next.6mo.prediction2),col='red',type='o')
+lines(1:30,e_t.pred2$lower[,2],col="red",lty="dashed")
+lines(1:30,e_t.pred2$upper[,2],col="red",lty="dashed")
+legend(1,7,legend=c("Actual","Predicted"),lwd=2,col=c("black","red") )
+```
+
+# From the predicting plots and MSE, we can get that arima1 is more optimal
+
+#  The forecasting plot of pm2.5 for the next one year
+```{r}
+arima1.forecast <- forecast(arima1, h=365)
+plot(arima1.forecast)
+```
+
+# Using the powerful Facebook's Library Prophet for forecasting.¶
+# Prophet follows the sklearn model API. We create an instance of the Prophet class and then call its fit and predict methods.
+```{r}
+pm2.5.temp <- pm2.5[,c("date","pm2.5")]
+colnames(pm2.5.temp)<- c("ds","y")
+summary(pm2.5.temp)
+pm2.5.prophet <- prophet(pm2.5.temp,daily.seasonality = TRUE)
+summary(pm2.5.prophet)
+```
+
+# Plot the forecast
+# Broken down the forcast into trend, weekly seasonality, and yearly seasonality
+```{r}
+#pm2.5.prophet.future <- make_future_dataframe(pm2.5.prophet, periods = 12)
+#tail(pm2.5.prophet.future)
+#pm2.5.prophet.forcast <- predict(pm2.5.prophet,pm2.5.prophet.future)
+#tail(pm2.5.prophet.forcast[c('ds', 'yhat', 'yhat_lower', 'yhat_upper')])
+#plot(pm2.5.prophet.forcast)
+#prophet_plot_components(pm2.5.prophet.forcast)
+```
+
+# I haven't compelte this part yet
